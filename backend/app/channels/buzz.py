@@ -49,10 +49,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.channels import buzz_nostr
+from app.channels.allowed_users import parse_allowed_users, parse_channel_ids
 from app.channels.base import Channel
 from app.channels.buzz_seen_events import BuzzSeenEventStore
 from app.channels.commands import is_known_channel_command
-from app.channels.connection_identity import attach_connection_identity
+from app.channels.connection_identity import attach_connection_identity, lookup_thread_id
 from app.channels.message_bus import InboundMessage, InboundMessageType, InboundQueueFullError, MessageBus, OutboundMessage
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,30 @@ def _is_transient_close(reason: str) -> bool:
     return not any(marker in text for marker in _PERMANENT_CLOSE_MARKERS)
 
 
+def _parse_member_pubkey(value: Any) -> str | None:
+    """Return the member's hex pubkey, or None when the entry is not one.
+
+    Shared parse_allowed_users coerces config entries through this, so a
+    scalar pubkey is one member and an unusable entry is dropped with a
+    warning instead of aborting channel construction.
+    """
+    try:
+        return buzz_nostr.parse_pubkey(str(value))
+    except ValueError:
+        return None
+
+
+def _parse_mention_free_channels(mention_free_channels: Any) -> frozenset[str]:
+    """Parse Buzz mention exemptions without splitting scalar channel IDs."""
+    return parse_channel_ids(
+        mention_free_channels,
+        logger=logger,
+        channel_name="buzz",
+        key_name="mention_free_channels",
+        warn_on_scalar_separators=True,
+    )
+
+
 class BuzzChannel(Channel):
     _connect: Any = None  # test seam: async callable returning an async-context-manager transport
 
@@ -265,9 +290,20 @@ class BuzzChannel(Channel):
         self._workspace_id = urlparse(self._relay_url).netloc
         self._private_key_raw = str(config.get("private_key", ""))
         self._keys: buzz_nostr.NostrKeys | None = None  # parsed in start() so coincurve stays lazy
-        self._allowed_users = {buzz_nostr.parse_pubkey(v) for v in config.get("allowed_users", []) or []}
+        self._allowed_users = (
+            parse_allowed_users(
+                config.get("allowed_users"),
+                parse_user_id=_parse_member_pubkey,
+                logger=logger,
+                channel_name="buzz",
+                expected_id="a 64-hex or npub1... member pubkey",
+                valid_id_name="member pubkey",
+                warn_on_scalar_separators=True,
+            )
+            or frozenset()
+        )
         self._require_mention = bool(config.get("require_mention", True))
-        self._mention_free = {str(c) for c in config.get("mention_free_channels", []) or []}
+        self._mention_free: frozenset[str] = _parse_mention_free_channels(config.get("mention_free_channels"))
         self._channel_meta: dict[str, dict[str, Any]] = {}
         self._stream_targets: dict[tuple[str, str | None], str] = {}
         self._stream_tails: dict[tuple[str, str | None], list[str]] = {}  # overflow chunk ids beyond chunk 0, per conversation
@@ -1316,12 +1352,6 @@ class BuzzChannel(Channel):
         # and returned above, so this gate only ever sees ordinary chat text.
         thread_root = self._thread_root(ev)
         mentioned = self._keys.pubkey_hex in buzz_nostr.tag_values(ev, "p")
-        store = self.config.get("channel_store")
-        engaged_thread = bool(thread_root and store is not None and store.get_thread_id(self.name, channel_id, topic_id=thread_root))
-        allowed_without_mention = (not self._require_mention) or channel_id in self._mention_free or self._is_dm(channel_id) or engaged_thread
-        if not mentioned and not allowed_without_mention:
-            return
-
         if mentioned:
             text = self._strip_own_mention(text)
 
@@ -1329,7 +1359,22 @@ class BuzzChannel(Channel):
         inbound: InboundMessage = self._make_inbound(chat_id=channel_id, user_id=author, text=text, msg_type=msg_type, thread_ts=thread_root, metadata={"event_id": str(ev.get("id", ""))})
         inbound.topic_id = thread_root
         inbound.workspace_id = self._workspace_id
+        # Resolved before the mention gate, not after: the manager maps a bound
+        # author's threads in the connection repository only, so the thread-follow
+        # check below can find them only through the resolved connection_id.
         inbound = await self._attach_connection_identity(inbound)
+
+        allowed_without_mention = (not self._require_mention) or channel_id in self._mention_free or self._is_dm(channel_id)
+        if not mentioned and not allowed_without_mention:
+            engaged_thread = bool(thread_root and await lookup_thread_id(inbound, repo=self._connection_repo, store=self.config.get("channel_store")))
+            if not engaged_thread:
+                # Logged like the allowlist drop above: "the bot stopped following my
+                # replies" must be triageable as require_mention working vs a lost
+                # bind or a missing thread mapping.
+                channel_name = self._channel_meta.get(channel_id, {}).get("name") or "<unnamed>"
+                logger.debug("[buzz] dropped unmentioned chat event in channel %s (%s): thread=%s not engaged (bound=%s)", channel_name, channel_id, thread_root, bool(inbound.connection_id))
+                return
+
         self._last_requester[(channel_id, thread_root)] = author
         await self._publish(inbound)
         # Only a fully accepted-and-published event advances the cursor, and only

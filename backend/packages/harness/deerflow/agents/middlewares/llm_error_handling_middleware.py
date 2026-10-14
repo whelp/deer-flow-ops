@@ -27,6 +27,7 @@ from deerflow.agents.middlewares.model_response import append_visible_text, fini
 from deerflow.config.app_config import AppConfig
 from deerflow.models.request_admission import AdmissionError
 from deerflow.utils.custom_events import aemit_custom_event, emit_custom_event
+from deerflow.utils.retry_after import bounded_retry_after_ms
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ def _consume_empty_response_retry(request: ModelRequest) -> bool:
     return True
 
 
-_RETRIABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_RETRIABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 _BUSY_PATTERNS = (
     "server busy",
     "temporarily unavailable",
@@ -163,6 +164,10 @@ _RETRY_BUDGET_OVERRIDES: dict[str, int] = {
 _REASON_RETRY_BUDGETS: dict[str, int] = {
     "burst_rate": 2,
 }
+
+# Lower-cased message of the ``ValueError`` langchain_core raises when a
+# streamed response (HTTP 200) yields no generation chunk at all.
+_EMPTY_STREAM_MARKER = "no generations found in stream"
 
 # Exception class names that indicate the upstream stream-chunk watchdog
 # fired because the model stalled mid-flight. These deserve a more specific
@@ -462,6 +467,17 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         # Circuit Breaker state
         self._circuit_lock = threading.Lock()
         self._circuit_failure_count = 0
+        # Recovery timing uses a monotonic clock, not wall time: ``_circuit_open_until``
+        # is a *duration* deadline (now + recovery_timeout_sec), and a wall-clock
+        # backward step (NTP correction, VM resume, manual change) while the circuit
+        # is open would hold the fast-fail window open far past the configured
+        # timeout — shedding every LLM call until the clock caught up — while a
+        # forward jump would end it early. ``time.monotonic`` never moves backward
+        # and matches the rest of the harness's timeout/deadline convention. The
+        # reference is instance-held so tests can inject a deterministic clock.
+        # ``0.0`` is below any monotonic reading, so the initial closed state never
+        # reads as a pending open window.
+        self._circuit_clock = time.monotonic
         self._circuit_open_until = 0.0
         self._circuit_state = "closed"
         self._circuit_generation = 0
@@ -496,7 +512,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
     def _check_circuit(self, *, probe_token: object | None = None) -> bool:
         """Returns True if circuit is OPEN (fast fail), False otherwise."""
         with self._circuit_lock:
-            now = time.time()
+            now = self._circuit_clock()
 
             if self._circuit_state == "open":
                 if now < self._circuit_open_until:
@@ -547,7 +563,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
             if not self._owns_current_circuit_generation(admission):
                 return
             if self._circuit_state == "half_open":
-                self._circuit_open_until = time.time() + self.circuit_recovery_timeout_sec
+                self._circuit_open_until = self._circuit_clock() + self.circuit_recovery_timeout_sec
                 self._circuit_generation += 1
                 self._circuit_state = "open"
                 self._circuit_probe_in_flight = False
@@ -560,7 +576,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
 
             self._circuit_failure_count += 1
             if self._circuit_failure_count >= self.circuit_failure_threshold:
-                self._circuit_open_until = time.time() + self.circuit_recovery_timeout_sec
+                self._circuit_open_until = self._circuit_clock() + self.circuit_recovery_timeout_sec
                 if self._circuit_state != "open":
                     self._circuit_generation += 1
                     self._circuit_state = "open"
@@ -636,6 +652,13 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         # provider failures rather than failing the whole run.
         if isinstance(exc, IndexError):
             return True, "transient"
+        # The streaming counterpart of the empty-``generations`` glitch above:
+        # ``langchain_core.language_models.chat_models.generate_from_stream``
+        # raises ``ValueError("No generations found in stream.")`` when the
+        # provider answers ``200 OK`` but the stream carries no chunk at all.
+        # Same upstream-payload glitch, same retry/backoff path.
+        if isinstance(exc, ValueError) and _EMPTY_STREAM_MARKER in lowered:
+            return True, "transient"
         if status_code in _RETRIABLE_STATUS_CODES:
             return True, "transient"
         if _matches_any(lowered, _BUSY_PATTERNS):
@@ -695,7 +718,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
     def _build_retry_delay_ms(self, prev_delay_ms: int | None, exc: BaseException, reason: str = "transient") -> int:
         """Compute the next retry delay (ms) using decorrelated jitter.
 
-        An explicit ``Retry-After`` from the provider is honored as-is (no
+        A finite ``Retry-After`` up to 24 hours is honored as-is (no
         jitter) - the server told us exactly when to come back, and for a
         burst-rate 429 this is strongly preferred over any computed delay.
         Otherwise AWS-style "decorrelated jitter" is applied:
@@ -1074,12 +1097,12 @@ def _extract_retry_after_ms(exc: BaseException) -> int | None:
 
     try:
         multiplier = 1 if "ms" in header_name.lower() else 1000
-        return max(0, int(float(raw) * multiplier))
-    except (TypeError, ValueError):
+        return bounded_retry_after_ms(float(raw) * multiplier)
+    except (TypeError, ValueError, OverflowError):
         try:
             target = parsedate_to_datetime(str(raw))
             delta = target.timestamp() - time.time()
-            return max(0, int(delta * 1000))
+            return bounded_retry_after_ms(delta * 1000)
         except (TypeError, ValueError, OverflowError):
             return None
 

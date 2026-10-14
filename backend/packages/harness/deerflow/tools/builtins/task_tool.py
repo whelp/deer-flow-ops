@@ -498,8 +498,8 @@ def _schedule_deferred_subagent_cleanup(
     try:
         cleanup_handle = run_on_isolated_subagent_loop(coro)
     except Exception:
-        # Unreachable in practice — the persistent loop backs the subagent
-        # execution itself, so it exists by the time a poller needs cleanup.
+        # The persistent loop can be temporarily fenced while retained
+        # shutdown ownership is still exiting; keep cleanup on the caller loop.
         logger.warning(
             f"[trace={trace_id}] Persistent subagent loop unavailable for deferred cleanup of {execution_id}; falling back to the caller loop",
             exc_info=True,
@@ -635,12 +635,23 @@ def _task_result_command(
     source_messages: list[dict] | None = None,
     receipt_verdict: dict | None = None,
     acceptance_verdict: dict | None = None,
+    knowledge_sources: list[dict] | None = None,
 ) -> Command:
     content, metadata_error = format_subagent_result_message(status, result=result, error=error, stop_reason=stop_reason)
     if acceptance_verdict is not None:
         # RFC #4651 PR4: the rendered checklist rides the model-visible result
         # text; metadata carries the structured verdict for the ledger/judge.
         content = f"{content}\n\n{render_acceptance_section(acceptance_verdict)}"
+    artifact = cited_source_artifact(source_messages or [], content, include_omissions=True)
+    if knowledge_sources:
+        from deerflow.knowledge.sources import forward_sources
+
+        content, unified_artifact = forward_sources(content, knowledge_sources)
+        if artifact is None:
+            artifact = unified_artifact
+        else:
+            # Preserve the native RAGFlow envelope for existing history and batch readers.
+            artifact = {**artifact, "retrieval_sources": unified_artifact["knowledge_sources"], "knowledge_sources_version": 1}
     return Command(
         update={
             "messages": [
@@ -648,7 +659,7 @@ def _task_result_command(
                     content=content,
                     tool_call_id=tool_call_id,
                     name="task",
-                    artifact=cited_source_artifact(source_messages or [], content),
+                    artifact=artifact,
                     additional_kwargs=make_subagent_additional_kwargs(
                         status,
                         result=result,
@@ -738,6 +749,14 @@ async def task_tool(
       every criterion that cannot be checked deterministically is marked
       UNVERIFIED — never silently passed. A `holds` leaf is execution evidence,
       not a guarantee that the deliverable is correct.
+    - JSON deliverables can opt into `file:<path> json-valid`: validate complete UTF-8 JSON
+      syntax up to 50,000 bytes, rejecting NaN/Infinity. Oversize files, incomplete reads,
+      or parser resource limits return UNVERIFIED. No schema or business validation;
+      .json files are not checked automatically.
+    - CSV deliverables can opt into `file:<path> csv-columns:["id","name"]`: check the
+      first UTF-8 header record (optional BOM), with exact required names and extra columns
+      allowed. Empty/duplicate headers fail; incomplete or oversized headers are UNVERIFIED.
+      The header budget is 50,000 bytes; data rows are not validated.
     - `completed` means execution ended, not task acceptance. Read each criterion
       and retain useful work. For `does not hold`, inspect the reason and repair
       or recheck only the unmet condition, reusing unaffected outputs.
@@ -766,6 +785,7 @@ async def task_tool(
             back marked UNVERIFIED. Example for a report-writing delegation:
             ["file:../outputs/report.md non-empty"]. Omit for open-ended
             exploration where no crisp acceptance condition exists.
+            JSON example: ["file:../outputs/report.json json-valid"].
         description: Optional short (3-5 word) description of the task for logging/display.
         context_mode: Defaults to isolated (only the delegated prompt). Choose
             snapshot when relevant requirements or failed approaches are spread
@@ -1120,6 +1140,7 @@ async def task_tool(
                     source_messages=getattr(result, "ai_messages", None),
                     receipt_verdict=receipt_verdict,
                     acceptance_verdict=acceptance_verdict,
+                    knowledge_sources=getattr(result, "knowledge_sources", None),
                 )
             elif result.status == SubagentStatus.FAILED:
                 _report_subagent_usage(runtime, result)

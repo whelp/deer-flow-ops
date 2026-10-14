@@ -5,6 +5,8 @@ import concurrent.futures
 import threading
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -20,6 +22,7 @@ from langgraph.errors import GraphBubbleUp
 from deerflow.agents.middlewares.llm_error_handling_middleware import (
     EmptyModelResponseError,
     LLMErrorHandlingMiddleware,
+    _extract_retry_after_ms,
 )
 from deerflow.config.app_config import AppConfig, LlmCallConfig
 from deerflow.config.sandbox_config import SandboxConfig
@@ -460,6 +463,27 @@ async def test_async_empty_stop_retries_once(monkeypatch: pytest.MonkeyPatch) ->
     ],
 )
 def test_nonempty_or_non_stop_response_is_not_classified_as_empty(message: AIMessage) -> None:
+    middleware = _build_middleware(retry_max_attempts=3)
+    attempts = 0
+
+    def handler(_request) -> AIMessage:
+        nonlocal attempts
+        attempts += 1
+        return message
+
+    result = middleware.wrap_model_call(SimpleNamespace(), handler)
+
+    assert result is message
+    assert attempts == 1
+
+
+@pytest.mark.parametrize("block_type", [[], {}, ["text"], {"type": "text"}])
+def test_unhashable_block_type_does_not_break_empty_response_classification(block_type: object) -> None:
+    """A provider may emit ``type: []`` / ``type: {}``; the visible-text probe must skip, not raise."""
+    message = AIMessage(
+        content=[{"type": block_type, "text": "ignored"}, {"type": "text", "text": "visible answer"}],
+        response_metadata={"finish_reason": "stop"},
+    )
     middleware = _build_middleware(retry_max_attempts=3)
     attempts = 0
 
@@ -1104,11 +1128,14 @@ def test_circuit_breaker_trips_and_recovers(monkeypatch: pytest.MonkeyPatch) -> 
     waits: list[float] = []
     monkeypatch.setattr("time.sleep", lambda d: waits.append(d))
 
-    # Mock time.time to decouple from private implementation details and enable time travel
+    # Drive the breaker's recovery timing through its injectable monotonic clock
+    # so the test can time-travel deterministically. The breaker measures the
+    # recovery window on this clock (not wall time), so advancing it is what
+    # moves the open->half_open transition.
     current_time = 1000.0
-    monkeypatch.setattr("time.time", lambda: current_time)
 
     middleware = _build_middleware(circuit_failure_threshold=3, circuit_recovery_timeout_sec=10)
+    middleware._circuit_clock = lambda: current_time
     monkeypatch.setattr(middleware, "_classify_error", mock_classify_retriable)
 
     request: Any = {"messages": []}
@@ -1270,10 +1297,11 @@ async def test_async_circuit_breaker_trips_and_recovers(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
+    # Time-travel via the breaker's injectable monotonic clock (see the sync twin).
     current_time = 1000.0
-    monkeypatch.setattr("time.time", lambda: current_time)
 
     middleware = _build_middleware(circuit_failure_threshold=3, circuit_recovery_timeout_sec=10)
+    middleware._circuit_clock = lambda: current_time
     monkeypatch.setattr(middleware, "_classify_error", mock_classify_retriable)
 
     async def async_failing_handler(request: Any) -> Any:
@@ -1645,6 +1673,75 @@ def test_async_index_error_exhausted_returns_user_fallback(
     assert "temporarily unavailable" in str(result.content)
 
 
+def test_classify_error_empty_stream_value_error_is_retriable_transient() -> None:
+    """The streaming path reports an HTTP-200-but-empty response as
+    ``ValueError("No generations found in stream.")`` (raised by
+    ``langchain_core...generate_from_stream``). It is the same upstream glitch
+    as the non-streaming empty-``generations`` IndexError and must be retried.
+    """
+    from langchain_core.language_models.chat_models import generate_from_stream
+
+    middleware = _build_middleware()
+    with pytest.raises(ValueError) as excinfo:
+        generate_from_stream(iter(()))
+    retriable, reason = middleware._classify_error(excinfo.value)
+    assert retriable is True
+    assert reason == "transient"
+
+
+def test_classify_error_unrelated_value_error_stays_generic() -> None:
+    middleware = _build_middleware()
+    retriable, reason = middleware._classify_error(ValueError("invalid literal for int()"))
+    assert retriable is False
+    assert reason == "generic"
+
+
+def test_async_empty_stream_retries_with_configured_budget_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    middleware = _build_middleware(retry_max_attempts=3, retry_base_delay_ms=10, retry_cap_delay_ms=10)
+    attempts = 0
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    async def handler(_request) -> AIMessage:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise ValueError("No generations found in stream.")
+        return AIMessage(content="ok")
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+
+    result = asyncio.run(middleware.awrap_model_call(SimpleNamespace(), handler))
+
+    assert isinstance(result, AIMessage)
+    assert result.content == "ok"
+    assert attempts == 3
+
+
+def test_sync_empty_stream_exhausted_uses_configured_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    middleware = _build_middleware(retry_max_attempts=2, retry_base_delay_ms=10, retry_cap_delay_ms=10)
+    attempts = 0
+
+    def handler(_request) -> AIMessage:
+        nonlocal attempts
+        attempts += 1
+        raise ValueError("No generations found in stream.")
+
+    monkeypatch.setattr("time.sleep", lambda _delay: None)
+
+    result = middleware.wrap_model_call(SimpleNamespace(), handler)
+
+    assert attempts == 2
+    assert isinstance(result, AIMessage)
+    assert result.additional_kwargs["deerflow_error_fallback"] is True
+    assert result.additional_kwargs["error_reason"] == "transient"
+
+
 # ---------- Process-wide concurrency limiter ----------
 
 
@@ -1869,6 +1966,97 @@ def test_retry_delay_honors_retry_after_without_jitter() -> None:
     exc = FakeError("rate limited", status_code=429, headers={"retry-after-ms": "5000"})
     delay = middleware._build_retry_delay_ms(100, exc)
     assert delay == 5000
+
+
+@pytest.mark.parametrize("header_name", ["Retry-After", "retry-after", "Retry-After-Ms", "retry-after-ms"])
+@pytest.mark.parametrize("header_value", ["1e999", "inf", "-inf", "nan", "1e15", "1e308", "99999999999999999999", "not-a-number"])
+def test_unusable_retry_after_falls_back_to_jitter(header_name: str, header_value: str) -> None:
+    """Unusable provider delays must fall back to bounded jitter."""
+    middleware = _build_middleware(retry_base_delay_ms=100, retry_cap_delay_ms=10000)
+    exc = FakeError("rate limited", status_code=429, headers={header_name: header_value})
+    assert 100 <= middleware._build_retry_delay_ms(100, exc) <= 300
+
+
+@pytest.mark.parametrize("header_name", ["Retry-After", "retry-after", "Retry-After-Ms", "retry-after-ms"])
+@pytest.mark.parametrize("header_value", ["1e999", "inf", "-inf", "nan", "1e15", "1e308", "99999999999999999999", "not-a-number"])
+def test_extract_unusable_retry_after_ms_returns_none(header_name: str, header_value: str) -> None:
+    """Mirror the delay-level cases, including nan's existing safe fallback."""
+    exc = FakeError("rate limited", status_code=429, headers={header_name: header_value})
+    assert _extract_retry_after_ms(exc) is None
+
+
+@pytest.mark.parametrize(
+    ("header_name", "header_value", "expected_ms"),
+    [
+        ("Retry-After", "60", 60000),
+        ("retry-after-ms", "60000", 60000),
+        ("Retry-After", "2.5", 2500),
+        ("retry-after-ms", "2.5", 2),
+        ("Retry-After", "-2", 0),
+        ("retry-after-ms", "-2", 0),
+        ("Retry-After", "0", 0),
+        ("retry-after-ms", "0", 0),
+        ("Retry-After", "86400", 86400000),
+        ("retry-after-ms", "86400000", 86400000),
+        ("Retry-After", "86400.001", None),
+        ("retry-after-ms", "86400001", None),
+    ],
+)
+def test_retry_after_numeric_boundaries(header_name: str, header_value: str, expected_ms: int | None) -> None:
+    exc = FakeError("rate limited", status_code=429, headers={header_name: header_value})
+    assert _extract_retry_after_ms(exc) == expected_ms
+    middleware = _build_middleware(retry_base_delay_ms=100, retry_cap_delay_ms=10000)
+    delay = middleware._build_retry_delay_ms(100, exc)
+    if expected_ms is None:
+        assert 100 <= delay <= 300
+    else:
+        assert delay == expected_ms
+
+
+@pytest.mark.parametrize(("delta_seconds", "expected_ms"), [(-60, 0), (60, 60000), (86400, 86400000), (86401, None)])
+def test_retry_after_date_boundaries(monkeypatch: pytest.MonkeyPatch, delta_seconds: int, expected_ms: int | None) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr(time, "time", lambda: now.timestamp())
+    raw = format_datetime(now + timedelta(seconds=delta_seconds), usegmt=True)
+    exc = FakeError("rate limited", status_code=429, headers={"Retry-After": raw})
+    assert _extract_retry_after_ms(exc) == expected_ms
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("header_name", ["Retry-After", "retry-after-ms"])
+@pytest.mark.parametrize("header_value", ["1e999", "nan", "1e15", "99999999999999999999", "Fri, 31 Dec 9999 23:59:59 GMT"])
+async def test_retry_loops_recover_from_unusable_hints(monkeypatch: pytest.MonkeyPatch, mode: str, header_name: str, header_value: str) -> None:
+    middleware = _build_middleware(retry_max_attempts=2, retry_base_delay_ms=100, retry_cap_delay_ms=300)
+    attempts = 0
+    waits: list[float] = []
+
+    def fake_sleep(delay: float) -> None:
+        assert 0.1 <= delay <= 0.3
+        waits.append(delay)
+
+    async def fake_async_sleep(delay: float) -> None:
+        fake_sleep(delay)
+
+    def handler(_request) -> AIMessage:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise FakeError("rate limited", status_code=429, headers={header_name: header_value})
+        return AIMessage(content="recovered")
+
+    async def async_handler(request) -> AIMessage:
+        return handler(request)
+
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+    monkeypatch.setattr(asyncio, "sleep", fake_async_sleep)
+    if mode == "sync":
+        result = middleware.wrap_model_call(SimpleNamespace(), handler)
+    else:
+        result = await middleware.awrap_model_call(SimpleNamespace(), async_handler)
+    assert result.content == "recovered"
+    assert attempts == 2
+    assert len(waits) == 1
 
 
 @pytest.mark.anyio
@@ -2795,3 +2983,78 @@ def test_concurrent_burst_failures_get_distinct_jittered_delays() -> None:
         _random.setstate(saved_state)
     assert all(5000 <= d <= 8000 for d in delays)
     assert len(set(delays)) > 1  # de-synchronized, not a single 5000ms tick
+
+
+class _FakeMonotonic:
+    """A manually advanced monotonic clock for deterministic recovery timing."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self._now = start
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+def _trip_circuit_open(middleware: LLMErrorHandlingMiddleware) -> None:
+    """Drive the breaker to OPEN with a configurable recovery window."""
+    middleware.circuit_failure_threshold = 1
+    middleware.circuit_recovery_timeout_sec = 60
+    middleware._record_failure()
+    assert middleware._circuit_state == "open"
+    assert middleware._check_circuit() is True  # fast-fail while open
+
+
+def test_circuit_recovery_is_measured_on_the_injected_monotonic_clock() -> None:
+    """The open->half_open transition tracks monotonic *elapsed* time.
+
+    The breaker stores ``_circuit_open_until = clock() + recovery_timeout_sec``
+    and fast-fails while ``clock() < _circuit_open_until``. Reading the recovery
+    deadline from the injected monotonic clock means it recovers after exactly
+    ``recovery_timeout_sec`` of elapsed time, independent of any wall-clock move.
+    """
+    clock = _FakeMonotonic()
+    middleware = _build_middleware(retry_max_attempts=1)
+    middleware._circuit_clock = clock
+    _trip_circuit_open(middleware)
+
+    # Just before the window elapses: still open.
+    clock.advance(59.9)
+    assert middleware._check_circuit() is True
+    assert middleware._circuit_state == "open"
+
+    # Once the monotonic window elapses: a single probe is admitted (half_open).
+    clock.advance(0.1)
+    assert middleware._check_circuit() is False
+    assert middleware._circuit_state == "half_open"
+    assert middleware._circuit_probe_in_flight is True
+
+
+def test_circuit_recovery_survives_a_backward_wall_clock_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A backward wall-clock step must not extend the fast-fail window.
+
+    Regression for the breaker measuring recovery with wall-clock ``time.time()``:
+    an NTP correction / VM resume / manual clock change that steps the wall clock
+    backward while the circuit is open would hold ``now < _circuit_open_until``
+    true far past ``recovery_timeout_sec``, shedding every LLM call until the wall
+    clock caught back up. Monotonic timing is immune: the recovery window advances
+    with real elapsed time regardless of what the wall clock does.
+    """
+    import deerflow.agents.middlewares.llm_error_handling_middleware as mod
+
+    clock = _FakeMonotonic()
+    middleware = _build_middleware(retry_max_attempts=1)
+    middleware._circuit_clock = clock
+    _trip_circuit_open(middleware)
+
+    # Simulate a large backward wall-clock step (e.g. the host's clock is pulled
+    # back by an hour) after the circuit opened. Monotonic elapsed time still
+    # reaches the recovery window, so the breaker must probe on schedule.
+    monkeypatch.setattr(mod.time, "time", lambda: 1_000_000.0 - 3600.0)
+    clock.advance(60.0)
+
+    assert middleware._check_circuit() is False
+    assert middleware._circuit_state == "half_open"
+    assert middleware._circuit_probe_in_flight is True

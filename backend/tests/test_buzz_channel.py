@@ -46,7 +46,7 @@ def _channel(**overrides) -> BuzzChannel:
 def test_registered_in_framework_registries():
     assert _CHANNEL_REGISTRY["buzz"] == "app.channels.buzz:BuzzChannel"
     assert _CHANNEL_CREDENTIAL_KEYS["buzz"] == ["private_key"]
-    assert CHANNEL_CAPABILITIES["buzz"] == {"supports_streaming": True}
+    assert CHANNEL_CAPABILITIES["buzz"] == {"supports_streaming": True, "proactive_notifications": False}
     policy = CHANNEL_RUN_POLICY["buzz"]
     assert policy.serialize_thread_runs is True and policy.requires_bound_identity is False
 
@@ -61,6 +61,78 @@ def test_config_parsing_normalizes_allowlist_and_defaults():
     assert ch._allowed_users == {OWNER}
     assert ch._require_mention is True and ch._mention_free == {CHANNEL}
     assert ch._relay_url == "wss://buzz.example.com"
+
+
+def test_config_mention_free_channel_accepts_a_single_id():
+    """One UUID, quoted or unquoted, is one entry -- not the characters of it.
+
+    A scalar was iterated as if it were a list, so the exemption matched nothing:
+    the channel the operator just made mention-free kept requiring a mention, which
+    looks exactly like a deaf bot. Discord documents and parses the same shape.
+    """
+    assert _channel(mention_free_channels=CHANNEL)._mention_free == frozenset({CHANNEL})
+    assert _channel(mention_free_channels=f"  {CHANNEL}  ")._mention_free == frozenset({CHANNEL})
+    assert CHANNEL in _channel(mention_free_channels=CHANNEL)._mention_free
+
+
+def test_config_mention_free_channel_accepts_a_non_string_scalar():
+    """An unquoted value YAML typed as a number must not abort channel setup."""
+    assert _channel(mention_free_channels=136852)._mention_free == frozenset({"136852"})
+
+
+def test_config_mention_free_channel_empty_shapes_mean_no_exemption():
+    for value in (None, "", "   ", [], frozenset()):
+        assert _channel(mention_free_channels=value)._mention_free == frozenset()
+
+
+def test_config_mention_free_channel_keeps_list_entries_verbatim():
+    ch = _channel(mention_free_channels=[CHANNEL, f" {CHANNEL_B} ", ""])
+    assert ch._mention_free == frozenset({CHANNEL, CHANNEL_B})
+
+
+def test_config_mention_free_channel_scalar_with_separators_warns(caplog):
+    """A comma/space-joined scalar is one literal id, and says so rather than going quiet."""
+    with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+        ch = _channel(mention_free_channels=f"{CHANNEL}, {CHANNEL_B}")
+    assert ch._mention_free == frozenset({f"{CHANNEL}, {CHANNEL_B}"})
+    assert "treating it as one literal channel id" in caplog.text
+
+
+def test_config_allowed_users_accepts_a_single_scalar_pubkey():
+    """One pubkey scalar is one member entry -- not the characters of it.
+
+    An ``allowed_users: $BUZZ_OWNER_PUBKEY`` style reference resolves to a
+    scalar string. Iterating it character by character fed each character to
+    ``parse_pubkey``, whose first non-hex character raised and aborted channel
+    construction. Sibling channels (QQ #6730, Discord) already treat a scalar
+    as a single entry.
+    """
+    assert _channel(allowed_users=OWNER)._allowed_users == frozenset({OWNER})
+    assert _channel(allowed_users=f"  {OWNER}  ")._allowed_users == frozenset({OWNER})
+
+
+def test_config_allowed_users_accepts_a_non_string_scalar_without_crashing():
+    """An unquoted scalar YAML typed as a number must not abort channel setup.
+
+    An int is not iterable, so constructing the channel raised
+    ``TypeError: 'int' object is not iterable``; the value is not a usable
+    pubkey, so the deny-by-default allowlist stays empty.
+    """
+    assert _channel(allowed_users=123)._allowed_users == frozenset()
+
+
+def test_config_allowed_users_drops_invalid_entries_with_a_warning(caplog):
+    """A mix of valid and unusable entries keeps the valid ones, fail-closed."""
+    with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+        ch = _channel(allowed_users=[OWNER, "not-a-pubkey", 42])
+    assert ch._allowed_users == frozenset({OWNER})
+    assert "Ignoring allowed_users entry" in caplog.text
+
+
+def test_config_allowed_users_empty_shapes_still_deny_by_default():
+    """Unset, blank and empty shapes keep the empty allowlist (deny all)."""
+    for value in (None, "", "   ", [], frozenset()):
+        assert _channel(allowed_users=value)._allowed_users == frozenset()
 
 
 def test_config_rejects_non_websocket_relay_url():
@@ -261,7 +333,7 @@ def test_mention_free_channel_and_thread_follow_pass_without_mention():
     assert len(captured) == 1
 
     class FakeStore:
-        def get_thread_id(self, channel_name, chat_id, topic_id=None):
+        async def get_thread_id(self, channel_name, chat_id, topic_id=None):
             return "thread-1" if topic_id == "aa" * 32 else None
 
     ch2, captured2 = _started()
@@ -324,6 +396,9 @@ class FakeConnectionRepo:
     async def find_connection_by_external_identity(self, *, provider, external_account_id, workspace_id=None):
         self.lookups.append({"provider": provider, "external_account_id": external_account_id, "workspace_id": workspace_id})
         return self._connections.get((provider, external_account_id, workspace_id))
+
+    async def get_thread_id(self, connection_id, external_conversation_id, external_topic_id=None):
+        return None  # no thread mapped yet; the real-repository round trip is pinned separately
 
 
 def test_connect_code_binds_and_never_publishes_even_for_unauthorized_author():
@@ -928,6 +1003,82 @@ def test_unbound_pubkey_inbound_message_carries_no_connection_identity():
     assert captured[0].connection_id is None and captured[0].owner_user_id is None
     assert captured[0].workspace_id == "buzz.example.com"
     assert [lookup["workspace_id"] for lookup in repo.lookups] == ["buzz.example.com"]
+
+
+# -- Thread-follow gate must read the mapping from where the manager wrote it ------
+
+
+@pytest.fixture
+async def sql_connection_repo(tmp_path):
+    from deerflow.persistence.channel_connections import ChannelConnectionRepository, ChannelCredentialCipher
+    from deerflow.persistence.engine import close_engine, get_session_factory, init_engine
+
+    await init_engine("sqlite", url=f"sqlite+aiosqlite:///{tmp_path / 'channels.db'}", sqlite_dir=str(tmp_path))
+    try:
+        yield ChannelConnectionRepository(get_session_factory(), cipher=ChannelCredentialCipher.from_key("test-encryption-key"))
+    finally:
+        await close_engine()
+
+
+@pytest.mark.anyio
+async def test_bound_pubkey_unmentioned_reply_follows_a_thread_the_manager_mapped_in_the_repo(sql_connection_repo, tmp_path):
+    """With channel connections enabled, ``ChannelManager._store_thread_id`` writes a
+    bound author's thread mapping to the connection repository *only*. The gate used
+    to read just the JSON ``ChannelStore``, so ``engaged_thread`` was always False for
+    bound authors and their unmentioned follow-ups were silently dropped. Driven
+    through the real manager, JSON store, and SQL repository (bound via a real
+    ``/connect``) so the write and read sides cannot drift apart."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.channels.manager import ChannelManager
+    from app.channels.store import JsonChannelStore
+
+    repo = sql_connection_repo
+    await repo.create_oauth_state(owner_user_id="owner-bound", provider="buzz", state="tok-bind", expires_at=datetime.now(UTC) + timedelta(minutes=10))
+    store = JsonChannelStore(tmp_path / "store.json")
+    ch, captured = _started(connection_repo=repo, channel_store=store)
+    ch._transport = FakeTransport()
+    manager = ChannelManager(bus=ch.bus, store=store, connection_repo=repo)
+    root = "aa" * 32
+
+    async def dispatch(ev):
+        await ch.handle_relay_frame(json.dumps(["EVENT", "sub1", ev]))
+
+    await dispatch(_event(sk=SK_OWNER, content="/connect tok-bind", mentions=()))
+    await dispatch(_event(sk=SK_OWNER, reply_to=root, created_at=1700000200))
+    assert len(captured) == 1 and captured[0].owner_user_id == "owner-bound"
+    connection_id = captured[0].connection_id
+    assert connection_id
+    await manager._store_thread_id(captured[0], "thread-1")
+    assert await store.get_thread_id("buzz", CHANNEL, topic_id=root) is None  # the manager wrote the repo only
+
+    await dispatch(_event(sk=SK_OWNER, content="follow-up", mentions=(), reply_to=root, created_at=1700000300))
+    assert len(captured) == 2
+    assert captured[1].text == "follow-up" and captured[1].topic_id == root
+    assert captured[1].connection_id == connection_id
+    assert await manager._lookup_thread_id(captured[1]) == "thread-1"
+
+
+def test_bound_pubkey_thread_follow_ignores_a_json_mapping_the_manager_would_not_read(caplog):
+    """The gate resolves the mapping exactly as ``ChannelManager._lookup_thread_id``
+    does: for a bound author that is the repository alone. A legacy JSON-store row for
+    the same topic (e.g. written before the pubkey was bound) is not this connection's
+    thread, so it must not relax ``require_mention``. The drop is logged at DEBUG with
+    the bind state, so "the bot stopped following my replies" stays triageable."""
+
+    class JsonStoreWithMapping:
+        async def get_thread_id(self, channel_name, chat_id, topic_id=None):
+            return "legacy-thread"
+
+    repo = FakeConnectionRepo(states={"tok-bind": "owner-bound"})
+    ch, captured = _started(connection_repo=repo, channel_store=JsonStoreWithMapping())
+    ch._transport = FakeTransport()
+
+    _dispatch(ch, _event(sk=SK_OWNER, content="/connect tok-bind", mentions=()))
+    with caplog.at_level(logging.DEBUG, logger="app.channels.buzz"):
+        _dispatch(ch, _event(sk=SK_OWNER, content="follow-up", mentions=(), reply_to="aa" * 32))
+    assert captured == []
+    assert f"dropped unmentioned chat event in channel <unnamed> ({CHANNEL}): thread={'aa' * 32} not engaged (bound=True)" in caplog.text
 
 
 # -- FINAL REVIEW FINDING 3 (Important): oversize streaming re-posted the tail ------

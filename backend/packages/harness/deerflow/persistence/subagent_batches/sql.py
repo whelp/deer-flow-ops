@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import defer
 
 from deerflow.persistence.subagent_batches.model import SubagentBatchItemRow, SubagentBatchRow
 from deerflow.subagents.acceptance_checks import AcceptanceVerdict, validate_acceptance_verdict
@@ -88,6 +89,7 @@ class SubagentBatchRepository:
         data["acceptance_verdict"] = validate_acceptance_verdict(row.acceptance_verdict)
         if include_result:
             data["result"] = row.result
+            data["result_artifact"] = row.result_artifact
         for key in _ITEM_TIMESTAMP_FIELDS:
             if data.get(key) is not None:
                 data[key] = coerce_iso(data[key])
@@ -221,6 +223,12 @@ class SubagentBatchRepository:
             if batch is None or batch.user_id != user_id:
                 return None
             stmt = select(SubagentBatchItemRow).where(SubagentBatchItemRow.batch_id == batch_id)
+            # Full reports and evidence reach max_result_chars each; the polled
+            # item list returns only previews, so leave them out of the SELECT.
+            if not include_result:
+                stmt = stmt.options(defer(SubagentBatchItemRow.result, raiseload=True), defer(SubagentBatchItemRow.result_artifact, raiseload=True))
+            if not include_prompt:
+                stmt = stmt.options(defer(SubagentBatchItemRow.prompt, raiseload=True))
             if status is not None:
                 stmt = stmt.where(SubagentBatchItemRow.status == status)
             stmt = stmt.order_by(SubagentBatchItemRow.position).offset(offset).limit(limit)
@@ -264,6 +272,7 @@ class SubagentBatchRepository:
                         )
                     ).scalars()
                 )
+                terminalized_expired = False
                 for item in expired:
                     item.lease_owner = None
                     item.lease_expires_at = None
@@ -271,13 +280,18 @@ class SubagentBatchRepository:
                     if item.cancel_requested_at is not None:
                         item.status = "cancelled"
                         item.completed_at = now
+                        terminalized_expired = True
                     elif item.attempt >= batch.max_attempts:
                         item.status = "failed"
                         item.error = item.error or "Execution lease expired after the maximum retry count"
                         item.completed_at = now
+                        terminalized_expired = True
                     else:
                         item.status = "queued"
                         item.error = "Previous worker lease expired; retrying"
+
+                if terminalized_expired:
+                    await self._refresh_batch_status(session, batch, now=now)
 
                 counts = await self._counts(session, batch.id)
                 live = counts["queued"] + counts["leased"] + counts["running"]
@@ -406,6 +420,7 @@ class SubagentBatchRepository:
         model_name: str | None,
         completed_at: datetime,
         acceptance_verdict: AcceptanceVerdict | None = None,
+        result_artifact: dict[str, Any] | None = None,
     ) -> bool:
         async with self._sf() as session:
             item = (
@@ -430,6 +445,7 @@ class SubagentBatchRepository:
             item.token_usage = token_usage
             item.updated_at = completed_at
             item.acceptance_verdict = None
+            item.result_artifact = None
             if cancelled:
                 item.status = "cancelled"
                 item.error = "Cancelled by user"
@@ -438,6 +454,7 @@ class SubagentBatchRepository:
                 item.status = "succeeded"
                 item.acceptance_verdict = validate_acceptance_verdict(acceptance_verdict)
                 item.result = result
+                item.result_artifact = result_artifact
                 item.result_preview = result_preview
                 item.result_truncated = result_truncated
                 item.error = None
@@ -573,14 +590,16 @@ class SubagentBatchRepository:
             item.attempt = 0
             item.error = None
             item.result = None
+            item.result_artifact = None
             item.result_preview = None
             item.result_truncated = False
             item.acceptance_verdict = None
             item.completed_at = None
             item.cancel_requested_at = None
             item.updated_at = now
-            batch.status = "queued"
-            batch.completed_at = None
-            batch.updated_at = now
+            if batch.status != "paused":
+                batch.status = "queued"
+                batch.completed_at = None
+                batch.updated_at = now
             await session.commit()
             return self._item_dict(item)

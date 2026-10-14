@@ -1,6 +1,6 @@
 # IM Channel Connections
 
-DeerFlow supports user-owned IM channel bindings for Telegram, Slack, Discord, Feishu/Lark, DingTalk, WeChat, WeCom, and Buzz. The feature reuses the existing `channels.*` runtime configuration, so it works in local and private deployments with the same outbound transports already supported by DeerFlow.
+DeerFlow supports user-owned IM channel bindings for Telegram, Slack, Discord, Feishu/Lark, DingTalk, WeChat, WeCom, QQ, and Buzz. The feature reuses the existing `channels.*` runtime configuration, so it works in local and private deployments with the same outbound transports already supported by DeerFlow.
 
 No public IP, OAuth callback URL, or provider webhook is required in this implementation.
 
@@ -448,6 +448,154 @@ Neither can make anything be *acted on*. The `allowed_users` allowlist and per-e
 
 **Bound identity:** once a pubkey completes `/connect`, its inbound messages resolve to that connection and run under the bound DeerFlow user (memory, files, and artifacts land in that user's buckets). Bindings are scoped to the relay host, so the same pubkey on a different relay is a different identity and must bind separately.
 
+### Feishu scheduled-task notifications
+
+Feishu/Lark sends scheduled-task result and lifecycle notices as static Markdown
+cards to the task owner's currently bound user. The existing notification outbox
+provides retry, localization, redaction and send-time binding checks; Settings
+reports this through `proactive_notifications`. Manual trial runs stay silent.
+
+The configured app needs bot messaging permission (`im:message:send_as_bot`, or
+its broader `im:message` alternative), and the recipient must be in its available
+scope. Complete `/connect <code>` in a private chat with the same app. The outbox
+keeps the application-scoped `open_id` as its identity; delivery prefers that
+owner's currently connected, explicitly recorded private-chat address. Group
+chats are never used for these personal notices. Older bindings without recorded
+chat type keep the `open_id` path; if Feishu rejects it with `230101`, bind again
+in private chat. Changing the app also requires rebinding.
+The existing WebSocket channel must be running; sends use the configured SDK's
+REST client, so no public callback or interactive-card subscription is needed.
+
+For provider-backed acceptance, bind a test user, let a once task run on its
+schedule, and confirm the notice arrives without another chat message. Check
+that a platform rejection is recorded as a failed delivery and that unbinding
+prevents later sends. API acceptance is not a read receipt. The shared outbox
+can retry an ambiguously acknowledged send; it does not promise exactly-once
+messages at the provider. Record whether domestic Feishu or international Lark
+was actually exercised.
+
+### Feishu group notifications
+
+Tasks may explicitly select one additional connected Feishu group. Personal
+notifications keep their existing recipients. The task stores the chosen
+`notification_group_connection_id`; a group notice stores that connection ID as
+its outbox target with `payload.target_type="group"`. It never infers a group
+destination from all of the owner's bindings.
+
+Add the app bot to a test or work group, grant `im:chat:read` for the group-name
+lookup, and publish the app changes. In the task form choose **Bind a Feishu
+group**, mention the bot and send the displayed `/connect` command in that
+group, then refresh and select its name. Name lookup failure does not discard
+the binding, but unnamed groups cannot be newly selected in the form: check
+the read permission and bind again. API selection and each delivery verify the
+task owner, connection ID, connected status, and recorded group/chat identity.
+The provider sends to that verified `chat_id`; a lost binding cannot fall back
+to another group or a private chat. A bot removed from the group produces a
+normal platform rejection handled by the existing retry budget.
+
+Omitting the field in PATCH preserves it; `null` clears it. Destination-only
+edits do not re-arm completed tasks or change the run budget. The destination
+is fixed when each notification is enqueued; later task edits affect future
+notices, and unbinding still blocks pending ones. Migration `0040` adds a nullable
+reference with no backfill. Upgrade Gateway workers and the frontend together;
+the form uses `/api/features.scheduled_tasks.group_notifications` to hide new
+selection on older Gateways. The conversation scheduling tool does not set
+group targets in this version.
+
+Real-provider acceptance should confirm that a selected task appears in the
+specified group, an unselected task remains private, and removing the bot or
+revoking its binding prevents a successful group send. Record the account and
+tenant setup actually used; the outbox remains at-least-once.
+
+### QQ WebSocket setup (MVP)
+
+QQ uses an outbound WebSocket connection for events and the QQ Open Platform
+HTTPS API for replies. No public server, webhook route, callback URL, or tunnel
+is required. This transport requires a bot whose developer console offers
+WebSocket access; availability should be checked for your bot.
+
+1. Create a bot in the QQ Open Platform console and select **WebSocket** under
+   development settings. Enable the private-message and group @mention
+   capabilities you intend to use. Configure permitted test accounts/groups in
+   the console when the bot is in testing; publishing and platform approval
+   requirements are separate from DeerFlow configuration.
+2. Supply `QQ_APP_ID` and `QQ_CLIENT_SECRET` to the Gateway process, or save the
+   App ID and Client secret through the administrator's Channels UI. Do not
+   commit credentials. A frontend `.env.local` file is not a substitute for
+   supplying the Gateway's environment.
+3. Configure the transport and, for authenticated users, the binding UI:
+
+```yaml
+channels:
+  qq:
+    enabled: true
+    app_id: $QQ_APP_ID
+    client_secret: $QQ_CLIENT_SECRET
+    allowed_users: []
+    sandbox: false
+
+channel_connections:
+  enabled: true
+  require_bound_identity: true
+  qq:
+    enabled: true
+```
+
+4. Restart the Gateway after editing YAML. In **Settings > Channels > QQ**, get
+   a one-time binding code and send `/connect <code>` to the bot. For a group
+   binding, @mention the bot before the command in that group. Then send a
+   private text message, or @mention the bot with text in the bound group.
+
+`allowed_users` contains QQ OpenIDs, not numeric QQ account numbers. An empty
+list admits ordinary messages from all senders, subject to the shared bound
+identity policy. As with other channels, a valid binding code is consumed
+before this allowlist. Treat the code as confidential; only bind in trusted
+groups. Private identities are scoped to the bot App ID; group identities are
+scoped to both the App ID and group OpenID. Do not assume private and group
+OpenIDs represent the same identity. Bind each context separately. Group
+conversation histories are isolated by sender, but replies remain visible to
+everyone in the group.
+
+List several OpenIDs as a YAML list. A single OpenID, such as an
+`allowed_users: $QQ_ALLOWED_USERS` reference, is one entry rather than a
+sequence of characters. An unset or null value, an empty list, and a blank or
+whitespace-only string such as `" "` all allow every sender; they do not
+restrict access. Entries that are not OpenID strings, such as numeric
+QQ account numbers, are ignored with a warning, and a mapping is rejected as a
+whole, so none of its keys is authorized. A configured value with no valid
+OpenID denies every sender and logs an error.
+
+The MVP supports text-only `C2C_MESSAGE_CREATE` and `GROUP_AT_MESSAGE_CREATE`
+events and final text replies. It does not download/upload attachments, stream
+partial answers or handle guild/channel messages. Scheduled private results
+use the separate proactive notification path described below. Replies require the original message ID: C2C replies have a 60-minute
+window with at most four replies per source message; group replies have a
+5-minute window with at most five replies. Long answers are split at UTF-8 character boundaries with a
+conservative 4,000-byte adapter budget per message; overflow is marked as
+truncated in the last permitted reply. Unknown or timezone-naive message
+timestamps use the full advisory window and emit a rate-limited warning without
+message content; QQ still enforces reply expiry server-side.
+Runs that finish after the platform's reply window remain available
+in DeerFlow but cannot be delivered through that source message. QQ may reject
+links that are not approved in the bot's URL allowlist.
+
+Use one active Gateway channel worker per bot for this MVP. Token refresh,
+heartbeat monitoring, reconnect backoff, and session Resume are automatic.
+Invalid sessions/sequence numbers trigger a fresh Identify. Bindings persist;
+session state, duplicate suppression and passive-reply contexts are bounded
+in-memory state and do not survive a process restart. The `sandbox` option
+changes only the REST API host; test-account/group membership is controlled
+separately in the QQ console.
+
+For an opt-in transport check, supply the two QQ credential environment
+variables, set `DEER_FLOW_RUN_LIVE_TESTS=1`, and run
+`uv run pytest -m live tests/test_qq_channel_live.py` from `backend/`.
+It checks READY, two heartbeat acknowledgements and shutdown; it does not send
+chat messages or establish end-to-end agent or group-message compatibility.
+
+Protocol references: [QQ event subscriptions](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/event-emit.html)
+and [message sending rules](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/send-receive/send.html).
+
 Codes use 128 bits of randomness, expire after 10 minutes, and are single-use.
 
 For providers with an `allowed_users` allowlist (Telegram, Slack, DingTalk, WeChat, …), a valid `/connect <code>` (or Telegram `/start <code>`) is consumed **before** the allowlist is checked. This is intentional: a user who is not yet on the allowlist — and whose platform identity the bot has therefore never seen — can still complete their first browser-initiated bind. After binding, `allowed_users` continues to gate ordinary (non-bind) messages as before.
@@ -459,7 +607,7 @@ Connection records live in SQL tables under `deerflow.persistence.channel_connec
 - `channel_connections`: owner user, provider identity, workspace/guild/team, status, metadata.
 - `channel_oauth_states`: one-time connect codes and Telegram deep-link state.
 - `channel_conversations`: connection-scoped IM conversation to DeerFlow thread mapping.
-- `channel_credentials`: reserved for future provider-token flows, not used by the local/private binding flow.
+- `channel_credentials`: per-connection provider tokens for future provider-token flows, encrypted with `DEER_FLOW_CREDENTIALS_KEY` (see [CONFIGURATION.md](CONFIGURATION.md#credentials-encryption-key-deer_flow_credentials_key)); not written by the local/private binding flow.
 
 Incoming messages that resolve to a connection carry `connection_id`, `owner_user_id`, and `workspace_id`. `ChannelManager` uses `owner_user_id` as the DeerFlow run user id and preserves the raw platform user id as `channel_user_id`.
 
@@ -469,9 +617,22 @@ from the browser runtime setup flow, which persists them through
 `ChannelRuntimeConfigStore` so local/private deployments can configure bots
 without editing YAML. The runtime store is a local plaintext JSON fallback with
 owner-only file permissions (`0600`); use it only where the DeerFlow data
-directory is already trusted as secret storage. WeChat QR login auth state
+directory is already trusted as secret storage. Every Gateway worker keeps its own copy
+of the file; a save or disconnect rereads it under an advisory sidecar lock
+(`.runtime-config.json.lock`) and changes only that provider, so workers sharing
+`DEER_FLOW_HOME` do not overwrite each other's bots. Reads still serve the copy
+the worker last loaded or wrote. WeChat QR login auth state
 follows the same local-runtime model and may persist a QR-derived bot token in
 the channel state directory.
+
+With several Gateway instances, `channels.leader_lease` gives each provider's
+platform connection to one instance: the holder of the provider's row in
+`channel_leases`. Bindings, connect codes and conversations are shared SQL
+state, so the connect flow works on any instance; `GET /api/channels/` names
+each provider's `leader`. Runtime credentials saved on an instance that does
+not hold the provider apply on the holder only when it next starts the
+channel. See
+[IM channel leader lease](CONFIGURATION.md#im-channel-leader-lease-channelsleader_lease).
 
 ## Security Notes
 
@@ -481,8 +642,11 @@ the channel state directory.
   responses mask password fields, and mutating runtime/channel-worker APIs
   require an admin user.
 - Stored per-connection credentials use the `channel_credentials` encryption
-  path. If stored credential material cannot be decrypted, DeerFlow treats it
-  as unavailable instead of using corrupt secrets.
+  path, keyed by `DEER_FLOW_CREDENTIALS_KEY` (or the generated
+  `{DEER_FLOW_HOME}/.credentials_key` on a single instance). If stored
+  credential material cannot be decrypted — a lost or changed key — DeerFlow
+  treats it as unavailable instead of using corrupt secrets. A declared
+  multi-instance deployment with channel connections enabled must set the key.
 - The local plaintext runtime credential fallback is documented above; prefer
   deployment-managed environment/config secrets for non-local deployments until
   a dedicated secret backend is configured.
@@ -491,3 +655,52 @@ the channel state directory.
 - Provider bot tokens remain in `channels.*` and are never returned to the browser.
 - Stored per-connection credentials are encrypted. If stored credential material cannot be decrypted, DeerFlow treats it as unavailable instead of using corrupt secrets.
 - This implementation does not add public provider callback or webhook routes.
+
+## Proactive notification settings
+
+The shared scheduler outbox sends result/lifecycle notices to bound private
+identities on WeCom, Feishu/Lark, WeChat and QQ. **Settings → Notifications → IM
+notifications** lists connected, push-capable apps with the same per-provider
+control. The setting is durable and owner-scoped, and also works in local
+`DEER_FLOW_AUTH_DISABLED=1` mode. It does not disable chatting, disconnect an
+account or stop a scheduled task. Browser notifications have a separate switch.
+
+Opting out stops new enqueueing and permanently closes pending/retrying notices
+for that owner/provider, including any selected Feishu group. Re-enabling does
+not replay these notices. A platform send already in progress may still arrive.
+Preference lookup failures park instead of sending; ordinary binding revocation,
+localized summaries, redaction, deduplication and retry budgets remain shared.
+Upgrade every Gateway worker before relying on an opt-out during a rolling
+upgrade. Downgrading below `0041_im_notice_preferences` removes the choices.
+
+### WeChat private notifications
+
+Use the existing iLink QR/bot setup and bind in a private chat. Send one private
+message so the worker can securely save the current conversation context. New
+contexts live in encrypted connection credentials and survive restart; private
+context tokens are not exposed by the browser connection API. Old bindings do
+not automatically trust a token previously stored in public metadata, and a
+changed bot token needs a fresh private message. Missing context or a platform
+rejection fails visibly rather than being recorded as sent. A server-expired
+context may need another private message. Notifications use the existing
+`sendmessage` HTTP path and require its success ACK, without a provider-local
+retry loop. WeChat group notification targets are not part of this version.
+
+Official protocol: [Tencent/openclaw-weixin](https://github.com/Tencent/openclaw-weixin/blob/main/docs/protocol.md).
+The client-side protocol does not guarantee that the server accepts missing or
+arbitrarily old conversation contexts; real account acceptance is still required.
+
+### QQ private notifications
+
+Configure the existing QQ WebSocket bot and `/connect` in **private/C2C chat**.
+Group member OpenIDs are a different recipient namespace; a group-only binding
+is not used as a private notification destination. A proactive notice uses
+`POST /v2/users/{user_openid}/messages`, without `msg_id`, `event_id`, passive reply
+sequence/quota or `is_wakeup`. The recipient must permit proactive messages and
+the bot must have platform access. Success requires a nonempty message ID ACK.
+Transport failures park; platform rejections use the shared retry budget.
+
+Current official rules are in the [QQ message overview](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html).
+Older GitHub bot-docs snapshots say proactive sending was discontinued; use the
+current live documentation and verify the actual bot account. QQ group
+notification destinations remain separate from the existing group chat replies.
