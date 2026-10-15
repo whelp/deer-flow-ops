@@ -1,0 +1,112 @@
+{
+  "meta": {
+    "title": "示例告警集 · 一次典型的接入层 flap 引发的告警瀑布",
+    "collect_window": "2026-10-14 02:00 ~ 02:40",
+    "note": "多厂商混合环境（华为 / H3C / 思科 / Linux），用于演示 netops-duty skill 的收敛与根因定位流程。所有设备名、IP、人员均为示例数据。",
+    "expected_conclusion": "根因不是核心交换机 CPU 高，也不是防火墙会话数高；而是 acc-sw-31 的 GE1/0/24 光模块收光劣化引发的端口 flap，进而造成 STP 拓扑震荡与广播泛洪。第一条与最后一条告警都不是根因。"
+  },
+  "alarms": [
+    {"ts": "2026-10-14 02:11:03", "device": "acc-sw-31",  "vendor": "H3C",   "severity": "critical", "code": "LINK-3-UP",    "message": "GE1/0/24 端口状态由 UP 变为 DOWN"},
+    {"ts": "2026-10-14 02:11:41", "device": "acc-sw-31",  "vendor": "H3C",   "severity": "critical", "code": "LINK-3-UP",    "message": "GE1/0/24 端口状态由 DOWN 变为 UP"},
+    {"ts": "2026-10-14 02:13:12", "device": "acc-sw-31",  "vendor": "H3C",   "severity": "critical", "code": "LINK-3-UP",    "message": "GE1/0/24 端口状态由 UP 变为 DOWN"},
+    {"ts": "2026-10-14 02:14:05", "device": "acc-sw-31",  "vendor": "H3C",   "severity": "major",    "code": "STP-6-TC",     "message": "检测到大量 STP 拓扑变更报文（TC BPDU），5 分钟内 63 个"},
+    {"ts": "2026-10-14 02:15:20", "device": "agg-sw-11",  "vendor": "H3C",   "severity": "major",    "code": "STP-6-TC",     "message": "收到来自 acc-sw-31 的拓扑变更通知，STP 开始重新收敛"},
+    {"ts": "2026-10-14 02:16:02", "device": "core-sw-01", "vendor": "华为",   "severity": "major",    "code": "CPU-4-HIGH",   "message": "CPU 利用率达到 82%，超过阈值 80%"},
+    {"ts": "2026-10-14 02:17:30", "device": "acc-sw-31",  "vendor": "H3C",   "severity": "major",    "code": "OPT-4-LOWRX",  "message": "GE1/0/24 光模块收光功率 -28.5 dBm，低于阈值 -25.0 dBm"},
+    {"ts": "2026-10-14 02:18:44", "device": "acc-sw-32",  "vendor": "华为",   "severity": "critical", "code": "LINK-3-UP",    "message": "GE0/0/12 端口状态由 UP 变为 DOWN"},
+    {"ts": "2026-10-14 02:20:11", "device": "fw-edge-01", "vendor": "华为",   "severity": "major",    "code": "SESSION-4",   "message": "并发会话数达到规格 78%，超过告警水位"},
+    {"ts": "2026-10-14 02:22:37", "device": "srv-app-01", "vendor": "Linux",  "severity": "major",    "code": "NET-4-LAT",    "message": "业务网络时延 P99 升至 212ms，超过阈值 200ms"},
+    {"ts": "2026-10-14 02:24:19", "device": "acc-sw-31",  "vendor": "H3C",   "severity": "critical", "code": "LINK-3-FLAP", "message": "GE1/0/24 端口 30 分钟内翻转 27 次，触发 flap 抑制"},
+    {"ts": "2026-10-14 02:26:51", "device": "core-sw-01", "vendor": "华为",   "severity": "major",    "code": "BCAST-4",      "message": "广播报文速率达到 4800 pps，超过阈值 3000 pps"},
+    {"ts": "2026-10-14 02:30:08", "device": "acc-sw-32",  "vendor": "华为",   "severity": "critical", "code": "LINK-3-UP",    "message": "GE0/0/12 端口状态由 DOWN 变为 UP"},
+    {"ts": "2026-10-14 02:33:26", "device": "agg-sw-11",  "vendor": "H3C",   "severity": "major",    "code": "STP-6-TC",     "message": "STP 拓扑变更计数持续增长，累计 118 次"},
+    {"ts": "2026-10-14 02:37:02", "device": "core-sw-01", "vendor": "华为",   "severity": "major",    "code": "CPU-4-HIGH",   "message": "CPU 利用率回落至 61%"}
+  ],
+  "devices": {
+    "acc-sw-31": {
+      "name": "B栋3层接入交换机",
+      "model": "H3C S5130S-28P-EI",
+      "location": "B栋 3 层弱电间 3F-IDF-2",
+      "owner": "张工",
+      "uptime_days": 1287,
+      "online_since": "2023-05-06",
+      "note": "承载 3 层办公区 46 个信息点；GE1/0/24 为上联端口"
+    },
+    "acc-sw-32": {
+      "name": "B栋3层接入交换机（备）",
+      "model": "华为 S5731-S24T4X",
+      "location": "B栋 3 层弱电间 3F-IDF-3",
+      "owner": "张工",
+      "uptime_days": 412,
+      "online_since": "2025-08-27",
+      "note": "承载 3 层会议室与打印区"
+    },
+    "agg-sw-11": {
+      "name": "B栋汇聚交换机",
+      "model": "H3C S6520X-30QC-EI",
+      "location": "B栋 1 层主配线间",
+      "owner": "李工",
+      "uptime_days": 903,
+      "online_since": "2024-04-25",
+      "note": "下挂 12 台接入交换机，acc-sw-31 / acc-sw-32 均为其下挂"
+    },
+    "core-sw-01": {
+      "name": "核心交换机（主）",
+      "model": "华为 CloudEngine CE6865-48S8CQ-EI",
+      "location": "A栋中心机房 A-01 机柜",
+      "owner": "网络组",
+      "uptime_days": 1680,
+      "online_since": "2022-03-11",
+      "note": "园区网核心，STP 根桥"
+    },
+    "core-sw-02": {
+      "name": "核心交换机（备）",
+      "model": "Cisco Nexus 93180YC-FX",
+      "location": "A栋中心机房 A-02 机柜",
+      "owner": "网络组",
+      "uptime_days": 1680,
+      "online_since": "2022-03-11",
+      "note": "园区网备用核心，本次未告警"
+    },
+    "fw-edge-01": {
+      "name": "互联网边界防火墙",
+      "model": "华为 USG6635E",
+      "location": "A栋中心机房 A-05 机柜",
+      "owner": "安全组",
+      "uptime_days": 866,
+      "online_since": "2024-06-01",
+      "note": "承载出口 NAT 与 IPSec VPN"
+    },
+    "srv-app-01": {
+      "name": "办公业务应用服务器",
+      "model": "虚拟化 VM 4C8G",
+      "location": "C栋虚拟化集群",
+      "owner": "应用运维组",
+      "uptime_days": 96,
+      "online_since": "2026-07-10",
+      "note": "OA 与门户后端"
+    }
+  },
+  "history": {
+    "acc-sw-31": [
+      {"date": "2026-09-18", "type": "端口 flap", "detail": "GE1/0/24 翻转 6 次，当时判定为尾纤接触不良，现场重插尾纤后恢复"},
+      {"date": "2026-08-02", "type": "端口 flap", "detail": "GE1/0/24 翻转 2 次，自行恢复，未处置"}
+    ],
+    "acc-sw-32": [
+      {"date": "2026-10-13", "type": "例行维护", "detail": "更换 GE0/0/12 光模块（新模块），变更单 CHG-20261013-041"}
+    ],
+    "core-sw-01": [
+      {"date": "2026-09-30", "type": "配置变更", "detail": "调整广播风暴抑制阈值，变更单 CHG-20260930-118"}
+    ]
+  },
+  "changes": [
+    {"ts": "2026-10-13 23:40", "object": "acc-sw-32", "type": "硬件更换", "detail": "更换 GE0/0/12 光模块", "ticket": "CHG-20261013-041"},
+    {"ts": "2026-10-14 02:45", "object": "acc-sw-31", "type": "计划变更", "detail": "原计划更换 GE1/0/24 光模块（故障已先发生，尚未执行）", "ticket": "CHG-20261014-007"}
+  ],
+  "runbook": [
+    {"symptom": "端口 flap / 光模块收光功率低", "action": "检查尾纤与法兰盘 → 清洁端面 → 更换光模块 → 更换尾纤；更换后观察 30 分钟 flap 计数"},
+    {"symptom": "STP 拓扑变更激增", "action": "定位根桥 → 核查边缘端口是否配置 portfast/BPDU 保护 → 检查是否有非受控设备接入"},
+    {"symptom": "广播报文速率超阈值", "action": "定位泛洪源端口 → 启用风暴抑制 → 检查是否有环路"},
+    {"symptom": "核心 CPU 高", "action": "先确认是否为控制面泛洪导致（看广播/组播速率），再查是否有攻击流量；不要直接重启核心"}
+  ]
+}

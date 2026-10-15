@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetOps Duty · AI 运维值班员 — 效果演示</title>
+<style>
+  :root{
+    --bg:#0b1017; --panel:#131a24; --panel2:#182231; --line:#223044;
+    --txt:#e6edf6; --dim:#8b9bb0; --dim2:#61718a;
+    --accent:#4ea8ff; --ok:#35d07f; --warn:#f0b429; --crit:#ff5f56;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Consolas,"Liberation Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:14px;line-height:1.65;-webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1200px;margin:0 auto;padding:0 24px 72px}
+
+  /* ---------- 顶栏 ---------- */
+  header{
+    border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,#0e1622 0%,var(--bg) 100%);
+    padding:26px 0 22px;margin-bottom:26px;
+  }
+  .brandrow{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .logo{
+    width:38px;height:38px;border-radius:9px;flex:0 0 auto;
+    background:linear-gradient(135deg,#2f7fe0,#1d4f96);
+    display:grid;place-items:center;font-size:19px;
+  }
+  h1{font-size:20px;margin:0;font-weight:650;letter-spacing:.2px}
+  .sub{color:var(--dim);font-size:12.5px;margin-top:2px}
+  .badge{
+    font-size:11.5px;padding:2.5px 9px;border-radius:99px;
+    border:1px solid var(--line);color:var(--dim);background:#0e1622;
+  }
+  .badge.live{border-color:#1f4d3a;color:var(--ok);background:#0d1f18}
+
+  /* ---------- 指标条 ---------- */
+  .metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin:0 0 26px}
+  .metric{
+    background:var(--panel);border:1px solid var(--line);border-radius:11px;
+    padding:14px 16px;
+  }
+  .metric .n{font-size:23px;font-weight:680;letter-spacing:-.4px;font-variant-numeric:tabular-nums}
+  .metric .l{font-size:11.5px;color:var(--dim);margin-top:3px}
+  .metric.hi .n{color:var(--accent)}
+  .metric.ok .n{color:var(--ok)}
+
+  /* ---------- 通用面板 ---------- */
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .phead{
+    display:flex;align-items:center;justify-content:space-between;gap:10px;
+    padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel2);
+  }
+  .ptitle{font-size:13.5px;font-weight:620;display:flex;align-items:center;gap:8px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);flex:0 0 auto}
+  .dot.red{background:var(--crit)} .dot.amber{background:var(--warn)} .dot.green{background:var(--ok)}
+  .hint{font-size:11.5px;color:var(--dim2)}
+
+  /* ---------- 主栅格 ---------- */
+  .top{display:grid;grid-template-columns:minmax(0,1.06fr) minmax(0,1fr);gap:18px;margin-bottom:18px}
+
+  /* 告警流 */
+  .alarms{max-height:452px;overflow-y:auto}
+  .alarm{
+    display:grid;grid-template-columns:66px 1fr;gap:10px;
+    padding:9px 16px;border-bottom:1px solid #1a2433;font-size:12.4px;
+  }
+  .alarm:last-child{border-bottom:none}
+  .alarm .t{font-family:var(--mono);color:var(--dim2);font-size:11.5px;padding-top:1px}
+  .alarm .m{min-width:0}
+  .alarm .dev{font-weight:620;font-size:12.4px}
+  .alarm .vn{
+    font-size:10.5px;padding:1px 6px;border-radius:4px;
+    border:1px solid var(--line);color:var(--dim);margin-left:7px;
+  }
+  .alarm .msg{color:var(--dim);font-size:12px;margin-top:1px;word-break:break-word}
+  .sev{font-size:10.5px;font-weight:700;letter-spacing:.4px;margin-right:8px}
+  .sev.c{color:var(--crit)} .sev.m{color:var(--warn)}
+
+  /* 分析区 */
+  .stage{padding:18px 18px 20px;min-height:452px;display:flex;flex-direction:column}
+  #idle{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center}
+  #idle .big{font-size:15px;color:var(--dim)}
+  #idle .small{font-size:12.5px;color:var(--dim2);max-width:330px;line-height:1.7}
+  button.run{
+    appearance:none;border:none;cursor:pointer;
+    background:linear-gradient(135deg,#2f7fe0,#1d5db8);color:#fff;
+    padding:11px 26px;border-radius:9px;font-size:14px;font-weight:620;
+    font-family:inherit;letter-spacing:.3px;
+    box-shadow:0 5px 18px rgba(47,127,224,.32);transition:.16s;
+  }
+  button.run:hover{transform:translateY(-1px);box-shadow:0 8px 22px rgba(47,127,224,.42)}
+  button.run:disabled{opacity:.45;cursor:default;transform:none;box-shadow:none}
+
+  .steps{font-family:var(--mono);font-size:12.3px;line-height:2.05;color:var(--dim)}
+  .steps .s{opacity:.35;transition:opacity .3s}
+  .steps .s.on{opacity:1;color:var(--txt)}
+  .steps .s.done::before{content:"✓ ";color:var(--ok);font-weight:700}
+  .steps .s.wait::before{content:"› ";color:var(--dim2)}
+  .steps .s.on.wait::before{content:"› ";color:var(--accent);animation:blink 1s steps(2) infinite}
+  @keyframes blink{50%{opacity:.25}}
+
+  /* 结论卡 */
+  #result{display:none;flex:1;flex-direction:column;gap:12px}
+  .rca{
+    border:1px solid #4a2f18;background:linear-gradient(135deg,#20160d,#191b22);
+    border-radius:10px;padding:15px 16px;
+  }
+  .rca .lab{font-size:11px;color:var(--warn);letter-spacing:1px;font-weight:700;margin-bottom:7px}
+  .rca .txt{font-size:14.6px;font-weight:620;line-height:1.6}
+  .chain{
+    margin-top:11px;font-size:12.3px;color:var(--dim);
+    font-family:var(--mono);display:flex;flex-wrap:wrap;gap:5px;align-items:center;
+  }
+  .chain .box{border:1px solid var(--line);background:#0f1620;border-radius:5px;padding:2px 8px;color:var(--txt)}
+  .chain .arw{color:var(--dim2)}
+  .evrow{display:flex;gap:9px;flex-wrap:wrap}
+  .ev{
+    flex:1 1 0;min-width:104px;background:var(--panel2);border:1px solid var(--line);
+    border-radius:9px;padding:9px 11px;
+  }
+  .ev .k{font-size:10.5px;color:var(--dim2);letter-spacing:.3px}
+  .ev .v{font-size:16px;font-weight:660;font-variant-numeric:tabular-nums;margin-top:2px}
+  .ev .v.s{font-size:12.6px;font-weight:600}
+
+  /* ---------- 报告全宽 ---------- */
+  .report{opacity:0;transform:translateY(9px);transition:opacity .45s ease,transform .45s ease}
+  .report.show{opacity:1;transform:none}
+  .rgrid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}
+  .body{padding:16px}
+
+  table{width:100%;border-collapse:collapse;font-size:12.6px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #1a2433;vertical-align:top}
+  th{color:var(--dim2);font-weight:600;font-size:11.3px;letter-spacing:.4px;background:#0f1620;position:sticky;top:0}
+  tbody tr:hover{background:#161f2c}
+  td.mono,.mono{font-family:var(--mono);font-size:11.9px}
+
+  .evgroup{display:flex;align-items:center;gap:11px;padding:9px 0;border-bottom:1px solid #1a2433}
+  .evgroup:last-child{border-bottom:none}
+  .tag{
+    font-size:10.6px;padding:2.5px 8px;border-radius:5px;font-weight:650;
+    white-space:nowrap;flex:0 0 auto;letter-spacing:.3px;
+  }
+  .tag.root{background:#3a1c1c;color:#ff8b84;border:1px solid #5a2a28}
+  .tag.deriv{background:#2a2312;color:var(--warn);border:1px solid #4a3c1c}
+  .tag.watch{background:#162535;color:#7fb8ea;border:1px solid #26405c}
+  .evgroup .nm{font-weight:620;font-size:12.8px;min-width:170px}
+  .evgroup .cnt{color:var(--dim2);font-size:11.8px;font-family:var(--mono)}
+
+  .hyp{border-left:2px solid var(--line);padding:0 0 0 13px;margin-bottom:16px}
+  .hyp:last-child{margin-bottom:0}
+  .hyp .h{font-size:12.9px;font-weight:640;margin-bottom:5px;display:flex;align-items:center;gap:8px}
+  .hyp .h .lv{
+    font-size:10.3px;font-weight:600;padding:1.5px 7px;border-radius:4px;
+    border:1px solid var(--line);color:var(--dim2);
+  }
+  .hyp .h .lv.hot{border-color:#5a2a28;color:#ff8b84;background:#3a1c1c}
+  .hyp ul{margin:0;padding-left:17px;color:var(--dim);font-size:12.3px}
+  .hyp li{margin-bottom:2px}
+  .hyp li b{color:var(--txt);font-weight:600}
+
+  .todo{counter-reset:t;list-style:none;margin:0;padding:0}
+  .todo li{
+    counter-increment:t;position:relative;padding:9px 0 9px 34px;
+    border-bottom:1px solid #1a2433;font-size:12.7px;
+  }
+  .todo li:last-child{border-bottom:none}
+  .todo li::before{
+    content:counter(t);position:absolute;left:0;top:9px;
+    width:21px;height:21px;border-radius:50%;background:#1d3457;
+    color:#8fc0ee;font-size:11.4px;font-weight:700;display:grid;place-items:center;
+    font-family:var(--mono);
+  }
+  .todo li .why{display:block;color:var(--dim2);font-size:11.9px;margin-top:2px}
+  .todo li code{
+    font-family:var(--mono);font-size:11.6px;background:#0f1620;
+    border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:#a9c8e8;
+  }
+
+  .chk{list-style:none;margin:0;padding:0}
+  .chk li{padding:7px 0 7px 24px;position:relative;font-size:12.7px;border-bottom:1px solid #1a2433}
+  .chk li:last-child{border-bottom:none}
+  .chk li::before{
+    content:"";position:absolute;left:0;top:12px;width:12px;height:12px;
+    border:1.5px solid var(--dim2);border-radius:3px;
+  }
+  .miss{color:var(--warn);font-size:12.7px;padding:7px 0;display:flex;gap:8px}
+  .miss::before{content:"!";flex:0 0 auto;width:15px;height:15px;border-radius:50%;
+    background:#3a2b12;color:var(--warn);font-size:10.5px;font-weight:800;
+    display:grid;place-items:center;margin-top:2px}
+
+  /* ---------- 底座条 ---------- */
+  .stack{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}
+  .sk{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:13px 15px}
+  .sk .k{font-size:11.4px;color:var(--dim2)}
+  .sk .v{font-size:13.2px;font-weight:620;margin-top:3px}
+
+  footer{
+    color:var(--dim2);font-size:12px;line-height:1.85;
+    border-top:1px solid var(--line);margin-top:34px;padding-top:20px;
+  }
+  footer b{color:var(--dim)}
+  footer code{font-family:var(--mono);font-size:11.5px;color:#a9c8e8}
+
+  @media (max-width:980px){
+    .top,.rgrid{grid-template-columns:1fr}
+    .metrics{grid-template-columns:repeat(2,1fr)}
+    .stack{grid-template-columns:repeat(2,1fr)}
+    .stage{min-height:auto}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="brandrow">
+      <div class="logo">🛰️</div>
+      <div style="flex:1;min-width:240px">
+        <h1>NetOps Duty · AI 运维值班员</h1>
+        <div class="sub">把一坨告警，变成一份能交接班、能复盘的值班报告</div>
+      </div>
+      <span class="badge live">离线部署 · 数据不出内网</span>
+      <span class="badge">零 API 成本</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="metrics">
+    <div class="metric"><div class="n">15</div><div class="l">原始告警条数</div></div>
+    <div class="metric"><div class="n">7</div><div class="l">涉及设备</div></div>
+    <div class="metric"><div class="n">3</div><div class="l">厂商 / 协议域</div></div>
+    <div class="metric hi"><div class="n">4</div><div class="l">收敛后事件组</div></div>
+    <div class="metric ok"><div class="n">268<span style="font-size:13px">s</span></div><div class="l">本地模型推理耗时</div></div>
+  </div>
+
+  <!-- ============ 输入 → 输出 ============ -->
+  <div class="top">
+
+    <div class="panel">
+      <div class="phead">
+        <div class="ptitle"><span class="dot red"></span>输入 · 夜间告警流</div>
+        <div class="hint">02:00 – 02:40 · 未整理</div>
+      </div>
+      <div class="alarms" id="alarmList"></div>
+    </div>
+
+    <div class="panel">
+      <div class="phead">
+        <div class="ptitle"><span class="dot"></span>输出 · AI 值班员分析</div>
+        <div class="hint" id="clockHint">待启动</div>
+      </div>
+      <div class="stage">
+        <div id="idle">
+          <div class="big">这 15 条告警里，只有 1 条是病根</div>
+          <div class="small">其余 14 条都是它造成的连锁反应。值班员的活，就是把这两者分开。</div>
+          <button class="run" id="runBtn">▶ 回放分析过程</button>
+          <div class="small" style="max-width:360px;font-size:11.8px;color:var(--dim2)">
+            本页为过程回放，内容取自本机 qwen3:8b 的真实运行结果
+          </div>
+        </div>
+
+        <div class="steps" id="steps" style="display:none"></div>
+
+        <div id="result">
+          <div class="rca">
+            <div class="lab">根因判断 · 强推断（待现场验证）</div>
+            <div class="txt">acc-sw-31 GE1/0/24 光模块劣化，导致端口反复 UP/DOWN</div>
+            <div class="chain">
+              <span class="box">光模块劣化</span><span class="arw">→</span>
+              <span class="box">端口 flap</span><span class="arw">→</span>
+              <span class="box">STP 拓扑震荡</span><span class="arw">→</span>
+              <span class="box">广播泛洪</span><span class="arw">→</span>
+              <span class="box">核心 CPU 升高</span>
+            </div>
+          </div>
+          <div class="evrow">
+            <div class="ev"><div class="k">根因候选</div><div class="v s">acc-sw-31</div></div>
+            <div class="ev"><div class="k">衍生事件</div><div class="v">2 组</div></div>
+            <div class="ev"><div class="k">待观察</div><div class="v">1 组</div></div>
+            <div class="ev"><div class="k">误判排除</div><div class="v">2 项</div></div>
+          </div>
+          <div style="font-size:12.2px;color:var(--dim2);line-height:1.75">
+            <b style="color:var(--dim)">模型没有上钩：</b>核心交换机 CPU 82%、边界防火墙会话数 78%
+            都是最扎眼的告警，但被正确判定为<b style="color:var(--dim)">衍生现象</b>，不是根因。
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 报告全文 ============ -->
+  <div class="report" id="report">
+
+    <div class="rgrid">
+      <div class="panel">
+        <div class="phead"><div class="ptitle"><span class="dot amber"></span>告警收敛结果</div><div class="hint">15 条 → 4 组</div></div>
+        <div class="body" style="padding-top:8px">
+          <div class="evgroup"><span class="tag root">根因候选</span><span class="nm">acc-sw-31</span><span class="cnt">02:11 起 · 6 条</span></div>
+          <div class="evgroup"><span class="tag deriv">衍生</span><span class="nm">agg-sw-11 / core-sw-01</span><span class="cnt">02:14 起 · 5 条</span></div>
+          <div class="evgroup"><span class="tag deriv">衍生</span><span class="nm">acc-sw-32</span><span class="cnt">02:18 起 · 2 条</span></div>
+          <div class="evgroup"><span class="tag watch">待观察</span><span class="nm">fw-edge-01 / srv-app-01</span><span class="cnt">02:20 起 · 2 条</span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="phead"><div class="ptitle"><span class="dot"></span>影响面</div></div>
+        <div class="body" style="padding-top:8px">
+          <table style="font-size:12.4px">
+            <tbody>
+              <tr><td style="color:var(--dim2);width:76px">业务</td><td>3 层办公区 46 个信息点、会议室与打印区、OA / 门户后端</td></tr>
+              <tr><td style="color:var(--dim2)">网络</td><td>STP 拓扑震荡、广播泛洪（4800 pps）、核心 CPU 82%</td></tr>
+              <tr><td style="color:var(--dim2)">设备</td><td>acc-sw-31（端口 flap 27 次 / 30 分钟）、agg-sw-11（STP 异常）</td></tr>
+              <tr><td style="color:var(--dim2)">等级</td><td><span style="color:var(--crit);font-weight:650">严重</span> · 多设备联动，业务可感</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom:18px">
+      <div class="phead"><div class="ptitle"><span class="dot"></span>时间线</div><div class="hint">按发生顺序还原，不是按级别排序</div></div>
+      <div class="body" style="padding-top:8px">
+        <table>
+          <thead><tr><th style="width:74px">时刻</th><th style="width:110px">对象</th><th>事件</th><th style="width:104px">来源码</th></tr></thead>
+          <tbody id="timeline"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="rgrid">
+      <div class="panel">
+        <div class="phead"><div class="ptitle"><span class="dot amber"></span>根因假设（4 类）</div></div>
+        <div class="body">
+          <div class="hyp">
+            <div class="h">硬件类 <span class="lv hot">当前最可能</span></div>
+            <ul>
+              <li>支持：<b>GE1/0/24 收光功率 −28.5 dBm</b>，低于 −25.0 dBm 阈值</li>
+              <li>支持：该端口 30 分钟内 <b>flap 27 次</b>，触发 flap 抑制</li>
+              <li>推翻条件：光模块指标正常且无 flap 计数</li>
+              <li>验证：<code>display transceiver interface</code> 查看收光功率与模块型号</li>
+            </ul>
+          </div>
+          <div class="hyp">
+            <div class="h">协议类 <span class="lv">次可能</span></div>
+            <ul>
+              <li>支持：STP 拓扑变更计数 63 → 118 次持续增长</li>
+              <li>支持：广播报文速率超阈值（3000 → 4800 pps）</li>
+              <li>推翻条件：STP 配置与根桥正常</li>
+              <li>验证：<code>display stp brief</code> 确认根桥为 core-sw-01</li>
+            </ul>
+          </div>
+          <div class="hyp">
+            <div class="h">变更类 <span class="lv">需补信息</span></div>
+            <ul>
+              <li>线索：存在计划变更 <b>CHG-20261014-007</b>（更换 acc-sw-31 光模块）</li>
+              <li>关键：该变更<b>实际执行时间待确认</b>，不能默认与故障时刻重合</li>
+              <li>验证：向变更执行人核实实际开始 / 结束时间</li>
+            </ul>
+          </div>
+          <div class="hyp">
+            <div class="h">容量类 <span class="lv">可排除</span></div>
+            <ul>
+              <li>支持：边界防火墙会话数 78%、业务时延 P99 212ms</li>
+              <li>推翻条件：会话数与时延未超基线 → <b>判定为泛洪的后果，非独立根因</b></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="phead"><div class="ptitle"><span class="dot green"></span>处置建议</div><div class="hint">按优先级</div></div>
+        <div class="body">
+          <ol class="todo">
+            <li>核查 acc-sw-31 GE1/0/24 光模块
+              <span class="why">先看光功率，再决定是否更换 —— 换件前别动配置</span>
+              <code>display transceiver interface GigabitEthernet1/0/24</code>
+            </li>
+            <li>确认 STP 根桥未被抢占
+              <span class="why">根桥若漂移到接入层，会放大震荡范围</span>
+              <code>display stp brief</code>
+            </li>
+            <li>采集核心交换机 CPU 基线（当前 61%）
+              <span class="why">给下一班留出"正常是什么样"的参照</span>
+              <code>display cpu-usage</code>
+            </li>
+            <li>核实变更 CHG-20261014-007 的实际执行时间
+              <span class="why">变更与故障的先后顺序，决定根因归属</span>
+            </li>
+          </ol>
+        </div>
+      </div>
+    </div>
+
+    <div class="rgrid">
+      <div class="panel">
+        <div class="phead"><div class="ptitle"><span class="dot"></span>交班必做</div></div>
+        <div class="body" style="padding-top:8px">
+          <ul class="chk">
+            <li>确认 GE1/0/24 flap 计数已归零，未再翻转</li>
+            <li>确认 STP 根桥为 core-sw-01，拓扑已稳定收敛</li>
+            <li>确认 core-sw-01 CPU 回落至基线区间</li>
+            <li>确认 acc-sw-32 GE0/0/12 状态稳定，非同一批光模块问题</li>
+          </ul>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="phead"><div class="ptitle"><span class="dot amber"></span>待补信息（报告里的"缺口"）</div></div>
+        <div class="body" style="padding-top:8px">
+          <div class="miss"><span>变更记录 CHG-20261014-007 的实际执行时间未确认</span></div>
+          <div class="miss"><span>acc-sw-31 与 core-sw-01 之间链路是否共享光缆 / 电源，未知</span></div>
+          <div class="miss"><span>广播抑制阈值与 CPU 基线缺历史数据，无法判断"是否常态化"</span></div>
+          <div style="font-size:12.1px;color:var(--dim2);margin-top:12px;line-height:1.75">
+            这些缺口<b style="color:var(--dim)">不会被编造填上</b>，而是明确标成"待补"——
+            报告的可信度，来自它知道自己不知道什么。
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 技术底座 ============ -->
+  <div class="stack">
+    <div class="sk"><div class="k">推理模型</div><div class="v">qwen3:8b（本地）</div></div>
+    <div class="sk"><div class="k">运行方式</div><div class="v">ollama · 单机离线</div></div>
+    <div class="sk"><div class="k">API 成本</div><div class="v" style="color:var(--ok)">¥0 / 次</div></div>
+    <div class="sk"><div class="k">数据流向</div><div class="v" style="color:var(--ok)">不出内网</div></div>
+  </div>
+
+  <footer>
+    <b>关于这个演示：</b>页面为<b>过程回放</b>，报告内容取自本机 <code>qwen3:8b</code> 对一份 15 条多厂商告警样例的真实推理结果
+    （耗时 268 秒，纯本地，无外部 API 调用）。运行脚本：<code>.agent/skills/netops-duty/scripts/demo_duty.py</code>，
+    样例数据：<code>assets/sample_alarms.json</code>。<br>
+    <b>它的定位：</b>不是替代值班员，是把"翻几十条告警找病根"这一步从 30 分钟压到一次点击，并把判断依据和不确定项一并交出来。
+  </footer>
+
+</div>
+
+<script>
+/* ---------- 告警数据 ---------- */
+const ALARMS = [
+  ["02:11:03","acc-sw-31","H3C","c","LINK-3-UP","GE1/0/24 端口状态由 UP 变为 DOWN"],
+  ["02:11:41","acc-sw-31","H3C","c","LINK-3-UP","GE1/0/24 端口状态由 DOWN 变为 UP"],
+  ["02:13:12","acc-sw-31","H3C","c","LINK-3-UP","GE1/0/24 端口状态由 UP 变为 DOWN"],
+  ["02:14:05","acc-sw-31","H3C","m","STP-6-TC","检测到大量 STP 拓扑变更报文（TC BPDU），5 分钟内 63 个"],
+  ["02:15:20","agg-sw-11","H3C","m","STP-6-TC","收到来自 acc-sw-31 的拓扑变更通知，STP 重新收敛"],
+  ["02:16:02","core-sw-01","华为","m","CPU-4-HIGH","CPU 利用率达到 82%，超过阈值 80%"],
+  ["02:17:30","acc-sw-31","H3C","m","OPT-4-LOWRX","GE1/0/24 光模块收光功率 −28.5 dBm，低于阈值 −25.0 dBm"],
+  ["02:18:44","acc-sw-32","华为","c","LINK-3-UP","GE0/0/12 端口状态由 UP 变为 DOWN"],
+  ["02:20:11","fw-edge-01","华为","m","SESSION-4","并发会话数达到规格 78%，超过告警水位"],
+  ["02:22:37","srv-app-01","Linux","m","NET-4-LAT","业务网络时延 P99 升至 212ms，超过阈值 200ms"],
+  ["02:24:19","acc-sw-31","H3C","c","LINK-3-FLAP","GE1/0/24 端口 30 分钟内翻转 27 次，触发 flap 抑制"],
+  ["02:26:51","core-sw-01","华为","m","BCAST-4","广播报文速率达到 4800 pps，超过阈值 3000 pps"],
+  ["02:30:08","acc-sw-32","华为","c","LINK-3-UP","GE0/0/12 端口状态由 DOWN 变为 UP"],
+  ["02:33:26","agg-sw-11","H3C","m","STP-6-TC","STP 拓扑变更计数持续增长，累计 118 次"],
+  ["02:37:02","core-sw-01","华为","m","CPU-4-HIGH","CPU 利用率回落至 61%"]
+];
+
+const TL = [
+  ["02:11:03","acc-sw-31","GE1/0/24 端口 DOWN","LINK-3-UP"],
+  ["02:11:41","acc-sw-31","GE1/0/24 端口 UP","LINK-3-UP"],
+  ["02:13:12","acc-sw-31","GE1/0/24 端口 DOWN（第 3 次）","LINK-3-UP"],
+  ["02:14:05","acc-sw-31","STP 拓扑变更计数 63","STP-6-TC"],
+  ["02:15:20","agg-sw-11","收到 acc-sw-31 拓扑变更，STP 重新收敛","STP-6-TC"],
+  ["02:16:02","core-sw-01","CPU 利用率 82%","CPU-4-HIGH"],
+  ["02:17:30","acc-sw-31","GE1/0/24 收光功率 −28.5 dBm","OPT-4-LOWRX"],
+  ["02:18:44","acc-sw-32","GE0/0/12 端口 DOWN","LINK-3-UP"],
+  ["02:20:11","fw-edge-01","并发会话数 78%","SESSION-4"],
+  ["02:22:37","srv-app-01","业务时延 P99 212ms","NET-4-LAT"],
+  ["02:24:19","acc-sw-31","GE1/0/24 30 分钟内 flap 27 次","LINK-3-FLAP"],
+  ["02:26:51","core-sw-01","广播报文 4800 pps","BCAST-4"],
+  ["02:30:08","acc-sw-32","GE0/0/12 端口 UP","LINK-3-UP"],
+  ["02:33:26","agg-sw-11","STP 变更计数累计 118","STP-6-TC"],
+  ["02:37:02","core-sw-01","CPU 回落至 61%","CPU-4-HIGH"]
+];
+
+const STEPS = [
+  "载入告警流 · 15 条 / 7 台设备",
+  "按设备与时序归并 → 4 个事件组",
+  "构建故障时间线 · 定位最早异常",
+  "关联变更记录 · 匹配计划作业",
+  "生成 4 类根因假设并逐一给推翻条件",
+  "标注证据等级与待补信息",
+  "输出值班报告"
+];
+
+/* ---------- 渲染告警 ---------- */
+const list = document.getElementById('alarmList');
+list.innerHTML = ALARMS.map(a => `
+  <div class="alarm">
+    <div class="t">${a[0]}</div>
+    <div class="m">
+      <div><span class="sev ${a[3]}">${a[3]==='c'?'CRIT':'MAJOR'}</span><span class="dev">${a[1]}</span><span class="vn">${a[2]}</span></div>
+      <div class="msg">${a[5]}</div>
+    </div>
+  </div>`).join('');
+
+document.getElementById('timeline').innerHTML = TL.map(t => `
+  <tr><td class="mono" style="color:var(--dim2)">${t[0]}</td><td>${t[1]}</td><td>${t[2]}</td><td class="mono" style="color:var(--dim2)">${t[3]}</td></tr>`).join('');
+
+/* ---------- 回放 ---------- */
+const runBtn = document.getElementById('runBtn');
+const idle    = document.getElementById('idle');
+const stepsEl = document.getElementById('steps');
+const result  = document.getElementById('result');
+const report  = document.getElementById('report');
+const clock   = document.getElementById('clockHint');
+let played = false;
+
+runBtn.addEventListener('click', () => {
+  if (played) return;
+  played = true;
+  runBtn.disabled = true;
+  idle.style.display = 'none';
+  stepsEl.style.display = 'block';
+  clock.textContent = '分析中…';
+
+  stepsEl.innerHTML = STEPS.map(s => `<div class="s">${s}</div>`).join('');
+  const nodes = [...stepsEl.querySelectorAll('.s')];
+
+  let i = 0;
+  (function tick(){
+    if (i > 0) { nodes[i-1].classList.remove('on','wait'); nodes[i-1].classList.add('done'); }
+    if (i >= nodes.length) {
+      clock.textContent = '完成 · 268s（本地模型）';
+      stepsEl.style.display = 'none';
+      result.style.display = 'flex';
+      report.classList.add('show');
+      return;
+    }
+    nodes[i].classList.add('on','wait');
+    i++;
+    setTimeout(tick, 520);
+  })();
+});
+</script>
+</body>
+</html>
